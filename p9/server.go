@@ -86,11 +86,14 @@ type connState struct {
 	fids  map[fid]*fidRef
 
 	// tags is the set of active tags.
-	//
-	// The given channel is closed when the
-	// tag is finished with processing.
 	tagMu sync.Mutex
-	tags  map[tag]chan struct{}
+	tags  map[tag]tagState
+
+	// ctx ends with the connection, and with it the context of every
+	// request that still runs, so that none waits for a client that is
+	// gone.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// messageSize is the maximum message size. The server does not
 	// do automatic splitting of messages.
@@ -423,25 +426,35 @@ func (cs *connState) DeleteFID(fid fid) error {
 	return fidRef.DecRef()
 }
 
-// StartTag starts handling the tag.
+// tagState is an active tag: done is closed when the tag is finished with
+// processing, and cancel ends the context of its request, as a Tflush of
+// the tag asks.
+type tagState struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+}
+
+// StartTag starts handling the tag, and returns the context of its
+// request.
 //
 // False is returned if this tag is already active.
-func (cs *connState) StartTag(t tag) bool {
+func (cs *connState) StartTag(t tag) (context.Context, bool) {
 	cs.tagMu.Lock()
 	defer cs.tagMu.Unlock()
 	_, ok := cs.tags[t]
 	if ok {
-		return false
+		return nil, false
 	}
-	cs.tags[t] = make(chan struct{})
-	return true
+	ctx, cancel := context.WithCancel(cs.ctx)
+	cs.tags[t] = tagState{done: make(chan struct{}), cancel: cancel}
+	return ctx, true
 }
 
 // ClearTag finishes handling a tag.
 func (cs *connState) ClearTag(t tag) {
 	cs.tagMu.Lock()
 	defer cs.tagMu.Unlock()
-	ch, ok := cs.tags[t]
+	st, ok := cs.tags[t]
 	if !ok {
 		// Should never happen.
 		panic("unused tag cleared")
@@ -449,20 +462,31 @@ func (cs *connState) ClearTag(t tag) {
 	delete(cs.tags, t)
 
 	// Notify.
-	close(ch)
+	st.cancel()
+	close(st.done)
+}
+
+// CancelTag ends the context of the request of the tag, if it is active.
+func (cs *connState) CancelTag(t tag) {
+	cs.tagMu.Lock()
+	st, ok := cs.tags[t]
+	cs.tagMu.Unlock()
+	if ok {
+		st.cancel()
+	}
 }
 
 // Waittag waits for a tag to finish.
 func (cs *connState) WaitTag(t tag) {
 	cs.tagMu.Lock()
-	ch, ok := cs.tags[t]
+	st, ok := cs.tags[t]
 	cs.tagMu.Unlock()
 	if !ok {
 		return
 	}
 
 	// Wait for close.
-	<-ch
+	<-st.done
 }
 
 // handleRequest handles a single request.
@@ -499,6 +523,9 @@ func (cs *connState) handleRequest() bool {
 			cs.server.log.Printf("p9.recv: %v", errSocket.error)
 		}
 		cs.recvShutdown = true
+		// End the requests that wait, such as for a lock: stop waits for
+		// them, and the client that would end them is gone.
+		cs.cancel()
 		cs.recvMu.Unlock()
 		return false
 	}
@@ -507,7 +534,13 @@ func (cs *connState) handleRequest() bool {
 	// of this tag right behind it would otherwise find no tag to wait for,
 	// and answer before this request does.
 	protocolErr := err != nil && err != io.EOF
-	started := !protocolErr && cs.StartTag(tag)
+	var (
+		ctx     context.Context
+		started bool
+	)
+	if !protocolErr {
+		ctx, started = cs.StartTag(tag)
+	}
 
 	// Ensure that another goroutine is available to receive from cs.t.
 	if atomic.LoadInt32(&cs.recvIdle) == 0 {
@@ -539,7 +572,7 @@ func (cs *connState) handleRequest() bool {
 	}
 
 	// Handle the message.
-	r := cs.handle(m)
+	r := cs.handle(ctx, m)
 
 	// Clear the tag before sending. That's because as soon as this
 	// hits the wire, the client can legally send another message
@@ -560,7 +593,7 @@ func (cs *connState) handleRequest() bool {
 	return true
 }
 
-func (cs *connState) handle(m message) (r message) {
+func (cs *connState) handle(ctx context.Context, m message) (r message) {
 	defer func() {
 		if r == nil {
 			// Don't allow a panic to propagate.
@@ -576,7 +609,10 @@ func (cs *connState) handle(m message) (r message) {
 		}
 	}()
 
-	if handler, ok := m.(handler); ok {
+	if h, ok := m.(contextHandler); ok {
+		// Call the message handler with the context of its request.
+		r = h.handleContext(ctx, cs)
+	} else if handler, ok := m.(handler); ok {
 		// Call the message handler.
 		r = handler.handle(cs)
 	} else {
@@ -619,8 +655,9 @@ func (s *Server) Handle(t io.ReadCloser, r io.WriteCloser) error {
 		t:      t,
 		r:      r,
 		fids:   make(map[fid]*fidRef),
-		tags:   make(map[tag]chan struct{}),
+		tags:   make(map[tag]tagState),
 	}
+	cs.ctx, cs.cancel = context.WithCancel(context.Background())
 	defer cs.stop()
 
 	// Serve requests from t in the current goroutine; handleRequests()
